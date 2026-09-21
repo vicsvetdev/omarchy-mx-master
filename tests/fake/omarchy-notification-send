@@ -1,0 +1,7 @@
+#!/bin/bash
+# Recording fake for the Omarchy notification command. Suites assert that a
+# threshold crossing notifies exactly once, so every invocation is logged.
+printf 'omarchy-notification-send' >> "${FAKE_LOG:?FAKE_LOG not set}"
+printf '\t%s' "$@" >> "$FAKE_LOG"
+printf '\n' >> "$FAKE_LOG"
+exit 0

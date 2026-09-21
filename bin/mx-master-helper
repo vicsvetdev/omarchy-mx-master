@@ -1,0 +1,1213 @@
+#!/usr/bin/env python3
+"""The Helper: the only thing in the system that talks to the mouse.
+
+It holds the Logi Bolt receiver's HID++ endpoint open and owns every decision
+the plugin makes — Arming, Conflict detection, Gesture recognition, Binding
+lookup and Action dispatch, battery state and its notification edges, and DPI.
+The bar widget renders what this publishes and decides nothing.
+
+It speaks HID++ to the mouse directly rather than driving another device
+manager; see docs/adr/0001-plugin-speaks-hidpp-directly.md.
+
+    stdin   one JSON object per line: {"settings": {...}} or {"cmd": "..."}
+    stdout  one JSON state object per line, whenever the state changes
+    stderr  a log
+
+Run it by hand to watch a misbehaving Gesture; `--once` prints one state line
+and exits without touching the device's configuration.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import errno
+import fcntl
+import json
+import math
+import os
+import select
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+# ----------------------------------------------------------------- protocol
+
+SHORT, LONG = 0x10, 0x11
+FRAME_LEN = {SHORT: 7, LONG: 20}
+RECEIVER = 0xFF
+SWID = 0x0F  # software id; the high bit keeps replies apart from notifications
+ONCE_SWID = 0x0E  # a one-shot run shares the receiver with the long-lived Helper
+
+# Feature ids. Feature *indices* are per-device and resolved at runtime — a
+# hardcoded index is how this breaks silently on the next firmware.
+F_ROOT = 0x0000
+F_DEVICE_NAME = 0x0005
+F_UNIFIED_BATTERY = 0x1004
+F_WIRELESS_DEVICE_STATUS = 0x1D4B
+F_REPROG_CONTROLS_V4 = 0x1B04
+F_ADJUSTABLE_DPI = 0x2201
+
+NOTIFY_DEVICE_CONNECTION = 0x41  # receiver notification: link established or lost
+
+# The Control under the thumb rest. The only Control this plugin takes over.
+GESTURE_CID = 0x00C3
+
+MAP_DIVERTED, MAP_DIVERTED_VALID = 0x01, 0x02
+MAP_RAW_XY, MAP_RAW_XY_VALID = 0x10, 0x20
+ARMED_FLAGS = MAP_DIVERTED | MAP_RAW_XY
+
+# The plugin id, which also names this plugin's runtime files. It has to agree
+# with manifest.json, with the widget's moduleName and with its IPC target; the
+# QML contract suite pins that agreement.
+PLUGIN_ID = "vicsvetdev.mx-master"
+
+VENDOR_LOGITECH = 0x046D
+BOLT_RECEIVERS = {0xC548}  # Logi Bolt. USB-C and Bluetooth are not this plugin's device.
+DEVICE_NAME_MATCH = "mx master 3s"
+
+DPI_MIN, DPI_MAX, DPI_STEP = 200, 8000, 50
+
+# ------------------------------------------------------------------ tuning
+
+# A mouse that has been left alone for a minute is dozing rather than gone, and
+# answers its first request in about 0.85 s — measured against the real device.
+# A timeout under that reports a mouse that is right there as absent, and the
+# widget vanishes off the bar while the user is looking at it.
+REQUEST_TIMEOUT = 3.0      # seconds to wait for a matching reply
+SCAN_TIMEOUT = 2.0         # a device that is genuinely absent errors back at once
+VERIFY_INTERVAL = 60.0     # the slow verify-and-repair tick
+DPI_THROTTLE = 0.15        # a drag arrives as a burst; the device sees a handful of writes
+BATTERY_HYSTERESIS = 5     # points above a threshold before its warning re-arms
+
+# One movement unit is 1/15 inch (about 1.7 mm) whatever the DPI, so a Gesture
+# feels the same after the DPI slider moves. The multiplier is Solaar's, and is
+# inherited deliberately along with the discarded first movement report.
+DPI_SCALE = 15.0
+
+# The threshold that separates a Tap from a Direction, in movement units —
+# about 3.4 mm of travel. Deliberately low: the Tap Action closes a tab and the
+# Direction Action reopens one, so an ambiguous Gesture should cost a spare tab
+# rather than the tab being read. Diversion suppresses ordinary pointer motion
+# (docs/findings/pointer-motion-under-diversion.md), so nothing pushes it up.
+MOVE_THRESHOLD = 2.0
+
+# Stillness this long ends a Segment. Solaar's value.
+SEGMENT_GAP = 0.200
+
+OUTCOMES = ("tap", "up", "down", "left", "right")
+
+DEFAULT_SETTINGS = {
+    "dpi": 1000,
+    "lowBattery": 20,
+    "criticalBattery": 10,
+    "bindings": {
+        "tap": {"window": "", "action": {"type": "keystroke", "keys": ["ctrl", "w"]}},
+        "up": {"window": "", "action": {"type": "keystroke", "keys": ["ctrl", "shift", "t"]}},
+        "down": None,
+        "left": None,
+        "right": None,
+    },
+}
+
+BATTERY_GLYPH = "\U000F0079"  # nf-md-battery, the glyph Omarchy's own battery notice uses
+
+
+def log(message):
+    sys.stderr.write(f"mx-master-helper: {message}\n")
+    sys.stderr.flush()
+
+
+# ---------------------------------------------------------------- transport
+
+
+class DeviceGone(Exception):
+    """The endpoint went away mid-conversation."""
+
+
+class DeviceError(Exception):
+    """The device answered with a HID++ error."""
+
+    def __init__(self, code):
+        super().__init__(f"device error 0x{code:02x}")
+        self.code = code
+
+
+class DeviceSilent(Exception):
+    """No matching reply arrived in time."""
+
+
+def open_endpoint(path):
+    """Open the device. A socket is how a test stands in for the receiver."""
+    try:
+        mode = os.stat(path).st_mode
+    except OSError as exc:
+        raise DeviceGone(str(exc)) from exc
+    if stat.S_ISSOCK(mode):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(path)
+        sock.setblocking(False)
+        return sock.detach()
+    return os.open(path, os.O_RDWR | os.O_NONBLOCK)
+
+
+def discover(root="/sys/class/hidraw", devdir="/dev"):
+    """Find the Bolt receiver's HID++ endpoint by vendor and by capability.
+
+    Never by device node number: that is not stable across a replug or a
+    resume. This mirrors how Solaar enumerates — the endpoint has to be a
+    Logitech Bolt receiver whose report descriptor actually carries the HID++
+    vendor collection with both the short and long report. The same mouse
+    reachable over USB-C or Bluetooth is a different endpoint and not this
+    plugin's device.
+    """
+    try:
+        nodes = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for node in nodes:
+        base = os.path.join(root, node, "device")
+        try:
+            with open(os.path.join(base, "uevent")) as fh:
+                fields = dict(
+                    line.split("=", 1) for line in fh.read().splitlines() if "=" in line
+                )
+            hid_id = fields.get("HID_ID", "")
+            _bus, vendor, product = (int(part, 16) for part in hid_id.split(":"))
+            if vendor != VENDOR_LOGITECH or product not in BOLT_RECEIVERS:
+                continue
+            with open(os.path.join(base, "report_descriptor"), "rb") as fh:
+                descriptor = fh.read()
+        except (OSError, ValueError):
+            continue
+        if speaks_hidpp(descriptor):
+            return os.path.join(devdir, node)
+    return None
+
+
+def speaks_hidpp(descriptor):
+    """True when the report descriptor declares the HID++ vendor collection."""
+    if b"\x06\x00\xff" not in descriptor:  # usage page 0xFF00
+        return False
+    return b"\x85\x10" in descriptor and b"\x85\x11" in descriptor  # report ids 0x10, 0x11
+
+
+class Link:
+    """A framed HID++ conversation with the receiver."""
+
+    def __init__(self, path, swid=SWID):
+        self.fd = open_endpoint(path)
+        self._buf = b""
+        self.pending = []  # notifications that arrived while awaiting a reply
+        # A one-shot run shares the receiver with the long-lived Helper. Giving
+        # it its own software id keeps the two from mistaking each other's
+        # replies for their own.
+        self.swid = swid
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+    def _read(self):
+        try:
+            chunk = os.read(self.fd, 4096)
+        except BlockingIOError:
+            return False
+        except OSError as exc:
+            raise DeviceGone(str(exc)) from exc
+        if not chunk:
+            raise DeviceGone("endpoint closed")
+        self._buf += chunk
+        return True
+
+    def _next_frame(self):
+        while self._buf:
+            size = FRAME_LEN.get(self._buf[0])
+            if size is None:
+                self._buf = self._buf[1:]  # resynchronise on an unknown report id
+                continue
+            if len(self._buf) < size:
+                return None
+            frame, self._buf = self._buf[:size], self._buf[size:]
+            return frame
+        return None
+
+    def drain(self):
+        """Every frame available right now, pending ones first."""
+        out, self.pending = self.pending, []
+        while True:
+            frame = self._next_frame()
+            if frame is None:
+                if not self._read():
+                    break
+                continue
+            out.append(frame)
+        return out
+
+    def write(self, frame):
+        payload = bytes(frame).ljust(FRAME_LEN[frame[0]], b"\0")
+        try:
+            os.write(self.fd, payload)
+        except OSError as exc:
+            raise DeviceGone(str(exc)) from exc
+
+    def _exchange(self, devnumber, head, payload, timeout, what):
+        """Write one frame and wait for the reply that echoes `head` back.
+
+        Notifications that arrive meanwhile are kept for the main loop rather
+        than handled here, so a device that talks while we ask it something
+        cannot re-enter the state machine.
+        """
+        self.write(bytes([SHORT, devnumber]) + head + bytes(payload))
+        end = time.monotonic() + timeout
+        while True:
+            frame = self._next_frame()
+            if frame is None:
+                left = end - time.monotonic()
+                if left <= 0:
+                    raise DeviceSilent(f"no reply to {what}")
+                ready, _, _ = select.select([self.fd], [], [], left)
+                if not ready:
+                    raise DeviceSilent(f"no reply to {what}")
+                self._read()
+                continue
+            if frame[1] == devnumber:
+                # A HID++ 1.0 error, then a HID++ 2.0 error, then the reply.
+                if frame[2] in (0x8F, 0xFF) and frame[3:5] == head:
+                    raise DeviceError(frame[5])
+                if frame[2:4] == head:
+                    return frame[4:]
+            self.pending.append(frame)
+
+    def request(self, devnumber, feature_index, function, params=b"", timeout=REQUEST_TIMEOUT):
+        """A HID++ 2.0 feature call."""
+        return self._exchange(
+            devnumber,
+            bytes([feature_index, (function << 4) | self.swid]),
+            params,
+            timeout,
+            f"feature {feature_index:#x} function {function:#x}",
+        )
+
+    def write_register(self, devnumber, register, value):
+        """A HID++ 1.0 register write — how the receiver is told to notify us."""
+        return self._exchange(
+            devnumber, bytes([0x80, register]), value, REQUEST_TIMEOUT,
+            f"register write {register:#x}",
+        )
+
+
+# ------------------------------------------------------------ the recogniser
+
+
+def classify(segments):
+    """Resolve a Gesture to exactly one outcome.
+
+    Dominant axis, not Solaar's rounded unit vector. Solaar reserves wide bands
+    for diagonals, which with four Directions and none would leave dead zones
+    where a slightly skewed flick matches nothing and the button looks broken.
+    Each Direction gets a full quadrant instead; see
+    docs/adr/0002-directions-are-classified-by-dominant-axis.md before
+    "fixing" this back.
+    """
+    if not segments:
+        return "tap"
+    x, y = segments[0]
+    if abs(x) > abs(y):
+        return "right" if x > 0 else "left"
+    return "up" if y < 0 else "down"
+
+
+class Recogniser:
+    """Accumulates movement while the Gesture Button is held."""
+
+    def __init__(self):
+        self.held = False
+        self._starting = False
+        self._dx = 0.0
+        self._dy = 0.0
+        self._last_move = None
+        self.segments = []
+
+    def press(self):
+        self.held = True
+        self._starting = True
+        self._dx = self._dy = 0.0
+        self._last_move = None
+        self.segments = []
+
+    def move(self, raw_dx, raw_dy, dpi, now):
+        if not self.held:
+            return
+        if self._starting:
+            # The MX Master 3S reports one bogus movement on button-down. Solaar
+            # carries this workaround annotated for this mouse specifically; it
+            # is a firmware quirk, not a rounding artefact, and the pointer
+            # residue seen during the spike is the same artefact. Solaar gates it
+            # on the feature version; this plugin does not, because it manages
+            # exactly one mouse and that mouse always reports the version that
+            # has the quirk — a gate that can never be false is untested code.
+            self._starting = False
+            return
+        self._starting = False
+        if self._last_move is not None and now - self._last_move > SEGMENT_GAP:
+            self._end_segment()
+        self._dx += raw_dx / dpi * DPI_SCALE
+        self._dy += raw_dy / dpi * DPI_SCALE
+        self._last_move = now
+
+    def _end_segment(self):
+        if math.hypot(self._dx, self._dy) >= MOVE_THRESHOLD:
+            self.segments.append((self._dx, self._dy))
+        self._dx = self._dy = 0.0
+
+    def release(self):
+        self._end_segment()
+        self.held = False
+        return classify(self.segments)
+
+    def abandon(self):
+        self.held = False
+        self.segments = []
+
+
+# ---------------------------------------------------------------- the helper
+
+
+class Helper:
+    def __init__(self, path, autostart, state_path, once=False):
+        self.path = path
+        self.autostart = autostart
+        self.state_path = state_path
+        self.once = once
+
+        self.settings = json.loads(json.dumps(DEFAULT_SETTINGS))
+        self.link = None
+        self.devnumber = None
+        self.features = {}
+        self.dpi_choices = []
+
+        self.present = False
+        self.armed = False
+        self.conflict = False
+        self.reason = None
+        self.battery = None
+        self.charging = False
+        self.device_dpi = self.settings["dpi"]
+
+        self.recogniser = Recogniser()
+        self._settings_seen = False
+        self._low_warned = False
+        self._critical_warned = False
+        self.load_warned_edges()
+
+        self._pending_dpi = None
+        self._pending_dpi_at = None
+        self._next_verify = time.monotonic() + VERIFY_INTERVAL
+        self._published = None
+        self._stdin = b""
+        self._running = True
+
+    # ------------------------------------------------------------ publishing
+
+    def snapshot(self):
+        if not self.present:
+            status = "offline"
+        elif self.conflict:
+            status = "conflict"
+        else:
+            status = "armed" if self.armed else "offline"
+        # The DPI range rides along because it is a fact about the device, and
+        # the alternative is the widget deciding for itself which values the
+        # mouse accepts — a decision, in the QML, outside the test seam.
+        choices = self.dpi_choices
+        return {
+            "present": self.present,
+            "battery": self.battery,
+            "charging": self.charging,
+            "dpi": self.device_dpi,
+            "dpiMin": choices[0] if choices else DPI_MIN,
+            "dpiMax": choices[-1] if choices else DPI_MAX,
+            "dpiStep": (choices[1] - choices[0]) if len(choices) > 1 else DPI_STEP,
+            "armed": self.armed,
+            "status": status,
+            "reason": None if status == "armed" else self.reason,
+            # The Bindings in force, so the panel shows what will actually
+            # happen rather than a second copy of the defaults kept in QML.
+            "bindings": {
+                name: (self.settings.get("bindings") or {}).get(name)
+                for name in OUTCOMES
+            },
+        }
+
+    def publish(self):
+        state = self.snapshot()
+        if state == self._published:
+            return
+        self._published = state
+        sys.stdout.write(json.dumps(state, sort_keys=True) + "\n")
+        sys.stdout.flush()
+
+    def go_offline(self, reason):
+        if self.present or self.reason != reason:
+            log(f"offline: {reason}")
+        self.present = False
+        self.armed = False
+        self.battery = None
+        self.charging = False
+        self.reason = reason
+        self.recogniser.abandon()
+        self.publish()
+
+    # -------------------------------------------------------------- protocol
+
+    def feature(self, feature_id):
+        """Resolve a feature index, caching it for as long as the link lives."""
+        if feature_id in self.features:
+            return self.features[feature_id]
+        reply = self.link.request(
+            self.devnumber, 0x00, 0x0, struct.pack("!H", feature_id) + b"\0"
+        )
+        index = reply[0] or None
+        self.features[feature_id] = index
+        return index
+
+    def device_name(self, devnumber):
+        index = self.link.request(
+            devnumber, 0x00, 0x0, struct.pack("!H", F_DEVICE_NAME) + b"\0",
+            timeout=SCAN_TIMEOUT,
+        )[0]
+        if not index:
+            return ""
+        length = self.link.request(devnumber, index, 0x0, timeout=SCAN_TIMEOUT)[0]
+        name = b""
+        while len(name) < length:
+            chunk = self.link.request(
+                devnumber, index, 0x1, bytes([len(name)]), timeout=SCAN_TIMEOUT
+            )
+            name += chunk[: min(16, length - len(name))]
+        return name.decode("ascii", "replace")
+
+    def find_device(self):
+        """Which index on the receiver is this plugin's mouse.
+
+        A paired keyboard or a second mouse is not this plugin's device, so the
+        index is confirmed by the name rather than assumed to be the first one
+        that answers.
+        """
+        for devnumber in range(1, 7):
+            try:
+                self.link.request(devnumber, 0x00, 0x1, b"\x00\x00\x5a", timeout=SCAN_TIMEOUT)
+                name = self.device_name(devnumber)
+            except (DeviceError, DeviceSilent):
+                continue
+            if DEVICE_NAME_MATCH in name.lower():
+                log(f"found {name} at device index {devnumber}")
+                return devnumber
+        return None
+
+    # -------------------------------------------------------------- the mouse
+
+    def open_link(self):
+        path = self.path or discover()
+        if not path:
+            self.go_offline("No Logi Bolt receiver found.")
+            return False
+        try:
+            self.link = Link(path, swid=ONCE_SWID if self.once else SWID)
+        except (DeviceGone, OSError) as exc:
+            self.go_offline(f"Cannot open the receiver: {exc}")
+            return False
+        log(f"opened {path}")
+        try:
+            # Ask the receiver to tell us when the mouse comes and goes.
+            # WIRELESS (0x000100) | SOFTWARE_PRESENT (0x000800).
+            self.link.write_register(RECEIVER, 0x00, b"\x00\x09\x00")
+        except (DeviceError, DeviceSilent) as exc:
+            log(f"could not enable receiver notifications: {exc}")
+        return True
+
+    def attach(self):
+        """Identify the mouse and read everything that does not write to it."""
+        if self.devnumber is None:
+            self.devnumber = self.find_device()
+            if self.devnumber is None:
+                self.go_offline("The mouse is asleep or disconnected.")
+                return False
+        try:
+            self.link.request(self.devnumber, 0x00, 0x1, b"\x00\x00\x5a", timeout=SCAN_TIMEOUT)
+        except (DeviceError, DeviceSilent):
+            self.go_offline("The mouse is asleep or disconnected.")
+            return False
+        self.present = True
+        self.reason = None
+        try:
+            self.feature(F_REPROG_CONTROLS_V4)
+            self.feature(F_WIRELESS_DEVICE_STATUS)
+            self.read_dpi_choices()
+            self.read_dpi()
+            self.read_battery()
+        except (DeviceError, DeviceSilent) as exc:
+            self.go_offline(f"The mouse stopped answering: {exc}")
+            return False
+        return True
+
+    def read_battery(self):
+        index = self.feature(F_UNIFIED_BATTERY)
+        if not index:
+            return
+        reply = self.link.request(self.devnumber, index, 0x1)
+        self.apply_battery(reply[0], reply[2])
+
+    def apply_battery(self, percent, status):
+        self.battery = int(percent)
+        # Discharging is 0; recharging, almost full, full and slow recharge all
+        # mean the cable is in.
+        self.charging = status in (0x01, 0x02, 0x03, 0x04)
+        self.check_battery_thresholds()
+
+    def load_warned_edges(self):
+        """Pick the low-battery edges back up from a previous life.
+
+        Which warnings have already been given is what makes an alert
+        edge-triggered, and the shell hot-reloads plugin code whenever any file
+        under the plugins directory is saved — so the Helper restarts often and
+        keeping this only in memory would re-announce a flat mouse every time.
+        It is runtime state, not configuration: it lives beside the lock file in
+        the runtime directory, never in the plugin folder, and the Helper still
+        reads no configuration file and watches none.
+        """
+        try:
+            with open(self.state_path) as fh:
+                stored = json.load(fh)
+        except (OSError, ValueError):
+            return
+        self._low_warned = bool(stored.get("low"))
+        self._critical_warned = bool(stored.get("critical"))
+
+    def save_warned_edges(self):
+        if self.once:
+            return
+        try:
+            with open(self.state_path, "w") as fh:
+                json.dump({"low": self._low_warned, "critical": self._critical_warned}, fh)
+        except OSError as exc:
+            log(f"cannot remember which battery warnings were given: {exc}")
+
+    def check_battery_thresholds(self):
+        """Edge-triggered, with hysteresis, so a low battery is said once.
+
+        A session that starts on an already-flat mouse is a crossing that
+        happened while nobody was watching, and is worth saying once — finding
+        out the mouse is dead is the whole point. Saying it twice is not, which
+        is what the remembered edges above are for.
+        """
+        low = int(self.settings.get("lowBattery") or 0)
+        critical = int(self.settings.get("criticalBattery") or 0)
+        level = self.battery
+        if level is None:
+            return
+        before = (self._low_warned, self._critical_warned)
+        if level > low + BATTERY_HYSTERESIS:
+            self._low_warned = False
+        if level > critical + BATTERY_HYSTERESIS:
+            self._critical_warned = False
+        if level <= critical and not self._critical_warned:
+            self._critical_warned = True
+            self._low_warned = True
+            self.notify(
+                "Mouse battery critical",
+                f"MX Master 3S at {level}%. Plug it in now.",
+                "critical",
+            )
+        elif level <= low and not self._low_warned:
+            self._low_warned = True
+            self.notify("Mouse battery low", f"MX Master 3S at {level}%.", "normal")
+        if (self._low_warned, self._critical_warned) != before:
+            self.save_warned_edges()
+
+    def notify(self, headline, description, urgency):
+        run_tool([
+            "omarchy-notification-send",
+            "-g", BATTERY_GLYPH,
+            "-u", urgency,
+            "--app-name", "mx-master",
+            headline, description,
+        ])
+
+    def read_dpi_choices(self):
+        if self.dpi_choices:
+            return  # a device's supported range is a fact about the device
+        index = self.feature(F_ADJUSTABLE_DPI)
+        if not index:
+            return
+        raw = b""
+        for page in range(4):
+            reply = self.link.request(self.devnumber, index, 0x1, bytes([0x00, 0x00, page]))
+            raw += bytes(reply[1:])
+            if b"\x00\x00" in bytes(reply[1:]):
+                break
+        self.dpi_choices = parse_dpi_list(raw)
+        if self.dpi_choices:
+            log(f"dpi range {self.dpi_choices[0]}-{self.dpi_choices[-1]}, {len(self.dpi_choices)} steps")
+
+    def read_dpi(self):
+        index = self.feature(F_ADJUSTABLE_DPI)
+        if not index:
+            return
+        reply = self.link.request(self.devnumber, index, 0x2, b"\x00")
+        value = (reply[1] << 8) | reply[2]
+        if value == 0:
+            value = (reply[3] << 8) | reply[4]
+        self.device_dpi = value
+
+    def write_dpi(self, value):
+        index = self.feature(F_ADJUSTABLE_DPI)
+        if not index:
+            return
+        self.link.request(self.devnumber, index, 0x3, b"\x00" + struct.pack("!H", value))
+        self.device_dpi = value
+        log(f"dpi set to {value}")
+
+    def snap_dpi(self, value):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return self.device_dpi
+        if self.dpi_choices:
+            return min(self.dpi_choices, key=lambda choice: (abs(choice - value), choice))
+        value = max(DPI_MIN, min(DPI_MAX, value))
+        return int(round(value / DPI_STEP) * DPI_STEP)
+
+    # --------------------------------------------------------------- arming
+
+    def probe_conflict(self):
+        """Is another program managing this mouse?
+
+        Two programs writing the same firmware registers produce silent,
+        confusing misbehaviour, so the plugin stands down rather than competing.
+        """
+        found = run_tool(["pgrep", "-x", "solaar"]) == 0
+        if found != self.conflict:
+            log("conflict with Solaar" if found else "conflict with Solaar is over")
+        self.conflict = found
+        return found
+
+    def read_diversion(self):
+        """Is the Gesture Button in Diversion right now, according to the mouse?"""
+        index = self.feature(F_REPROG_CONTROLS_V4)
+        if not index:
+            return None
+        flags = self.link.request(self.devnumber, index, 0x2, struct.pack("!H", GESTURE_CID))[2]
+        return (flags & ARMED_FLAGS) == ARMED_FLAGS
+
+    def arm(self):
+        """Put the Gesture Button into Diversion and confirm the mouse took it.
+
+        Idempotent and repeated: the mouse forgets Diversion whenever it loses
+        power, so this runs on every connect and again on the verify tick.
+        """
+        if self.conflict:
+            self.armed = False
+            self.reason = "Solaar is running and manages this mouse."
+            return
+        index = self.feature(F_REPROG_CONTROLS_V4)
+        if not index:
+            self.armed = False
+            self.reason = "This mouse does not offer reprogrammable controls."
+            return
+        if self.read_diversion():
+            # Already ours. This is the ordinary case on the verify tick, and
+            # asking first rather than writing blind keeps a minute-by-minute
+            # repair from being a minute-by-minute pair of device writes.
+            self.armed = True
+            self.reason = None
+            return
+        bfield = MAP_DIVERTED | MAP_DIVERTED_VALID | MAP_RAW_XY | MAP_RAW_XY_VALID
+        self.link.request(
+            self.devnumber, index, 0x3, struct.pack("!HBH", GESTURE_CID, bfield, 0)
+        )
+        self.armed = self.read_diversion() is True
+        self.reason = None if self.armed else "The mouse would not hand over the Gesture Button."
+        # Logged here and nowhere else, so the log carries the transition rather
+        # than a line a minute saying nothing changed.
+        log("gesture button armed" if self.armed
+            else "the mouse would not hand over the gesture button")
+
+    def resolve_conflict(self):
+        """Disable the conflicting program's autostart and stop it.
+
+        Its own configuration file is left alone — partly as manners, and partly
+        because Solaar rewrites that file on exit and would clobber the edit.
+        The autostart entry is a session file, and disabling it is the whole
+        resolution.
+        """
+        disable_autostart(self.autostart)
+        run_tool(["pkill", "-x", "solaar"])
+        log("disabled Solaar's autostart and stopped it")
+        self.reconcile()
+
+    # ------------------------------------------------------- the one handler
+
+    @contextlib.contextmanager
+    def device_conversation(self):
+        """Turn a mouse that stops answering into published state, not a crash.
+
+        A device that errors or falls silent is one that walked away; a device
+        whose endpoint vanished takes the link with it.
+        """
+        try:
+            yield
+        except (DeviceError, DeviceSilent) as exc:
+            self.go_offline(f"The mouse stopped answering: {exc}")
+        except DeviceGone as exc:
+            self.drop_link(str(exc))
+
+    def reconcile(self):
+        """Verify and repair. One handler, three jobs: Arm, DPI, battery.
+
+        Runs on every device-connect notification and again on the slow tick,
+        so state that drifted without a notification arriving is corrected
+        rather than waited on.
+        """
+        if self.link is None and not self.open_link():
+            return
+        with self.device_conversation():
+            if not self.attach():
+                return
+            self.probe_conflict()
+            if self.once:
+                # A one-shot run reports and leaves; it configures nothing.
+                self.armed = self.read_diversion() is True
+                if self.conflict:
+                    self.reason = "Solaar is running and manages this mouse."
+                elif not self.armed:
+                    self.reason = "The Gesture Button is not diverted."
+            elif self.conflict:
+                # While a Conflict exists the plugin writes no device
+                # configuration at all — not Diversion, not DPI.
+                self.armed = False
+                self.reason = "Solaar is running and manages this mouse."
+            else:
+                self.arm()
+                # The configured value is the source of truth for DPI, but the
+                # Helper does not guess at it before the Service has said what
+                # it is — that would reset the mouse on every start.
+                if self._settings_seen:
+                    wanted = self.snap_dpi(self.settings.get("dpi"))
+                    if wanted != self.device_dpi:
+                        self.write_dpi(wanted)
+        self.publish()
+
+    def drop_link(self, why):
+        log(f"link lost: {why}")
+        if self.link:
+            self.link.close()
+        self.link = None
+        self.devnumber = None
+        self.features = {}
+        self.dpi_choices = []
+        self.go_offline("The receiver went away.")
+
+    # ---------------------------------------------------------- notifications
+
+    def handle_frame(self, frame):
+        # Byte 2 is a HID++ 1.0 sub id from the receiver, or a feature index
+        # from the device; byte 3 is the address within it.
+        devnumber, sub_id, address = frame[1], frame[2], frame[3]
+
+        if sub_id == NOTIFY_DEVICE_CONNECTION:
+            # Bit 0x40 of the flags byte means the link is *not* established.
+            established = not (frame[4] & 0x40)
+            if self.devnumber is not None and devnumber != self.devnumber:
+                return
+            if established:
+                log("device connected")
+                self.reconcile()
+            else:
+                self.go_offline("The mouse is asleep or disconnected.")
+            return
+
+        if self.devnumber is None or devnumber != self.devnumber:
+            return
+
+        if sub_id == self.features.get(F_WIRELESS_DEVICE_STATUS) and address == 0x00:
+            log("device asked to be reconfigured")
+            self.reconcile()
+            return
+
+        if sub_id == self.features.get(F_UNIFIED_BATTERY) and address == 0x00:
+            self.apply_battery(frame[4], frame[6])
+            self.publish()
+            return
+
+        if sub_id == self.features.get(F_REPROG_CONTROLS_V4):
+            # Only a Control this plugin armed is this plugin's to act on. While
+            # a Conflict exists the other program has the Gesture Button
+            # diverted and is listening too; firing an Action off its Diversion
+            # is exactly the competing this plugin stands down from.
+            if not self.armed:
+                return
+            if address == 0x00:
+                self.handle_controls(frame)
+            elif address == 0x10 and self.recogniser.held:
+                dx, dy = struct.unpack("!hh", bytes(frame[4:8]))
+                self.recogniser.move(dx, dy, max(1, self.device_dpi), time.monotonic())
+
+    def handle_controls(self, frame):
+        """A diverted control reports which Controls are currently down."""
+        cids = struct.unpack("!HHHH", bytes(frame[4:12]))
+        down = GESTURE_CID in cids
+        if down and not self.recogniser.held:
+            self.recogniser.press()
+        elif not down and self.recogniser.held:
+            self.fire(self.recogniser.release())
+
+    def fire(self, outcome):
+        binding = (self.settings.get("bindings") or {}).get(outcome)
+        if not binding:
+            # An unbound Direction does nothing at all: no keystroke, no
+            # notification, no on-screen feedback.
+            log(f"gesture {outcome}: unbound")
+            return
+        # The window-match field exists so gating can return later without
+        # reshaping stored configuration. Nothing consults it yet.
+        action = binding.get("action") or {}
+        kind = action.get("type")
+        if kind == "keystroke":
+            keys = [str(key) for key in action.get("keys") or [] if str(key)]
+            if not keys:
+                return
+            log(f"gesture {outcome}: {'+'.join(keys)}")
+            run_tool(keystroke_argv(keys))
+        else:
+            log(f"gesture {outcome}: unsupported action {kind!r}")
+
+    # ---------------------------------------------------------------- stdin
+
+    def handle_line(self, line):
+        try:
+            message = json.loads(line)
+        except ValueError:
+            log(f"ignoring unparseable input: {line[:80]!r}")
+            return
+        if not isinstance(message, dict):
+            return
+        if "settings" in message and isinstance(message["settings"], dict):
+            self.apply_settings(message["settings"])
+        command = message.get("cmd")
+        if command == "refresh":
+            # Verify and repair now rather than waiting for the tick.
+            self.reconcile()
+        elif command == "resolveConflict":
+            self.resolve_conflict()
+        elif command:
+            log(f"unknown command {command!r}")
+
+    def apply_settings(self, values):
+        # Logged so a Helper's configuration can be read back after the fact,
+        # but without the DPI: a slider drag is a burst of a hundred and sixty
+        # settings messages, and a log line each would bury everything else.
+        before = {key: value for key, value in self.settings.items() if key != "dpi"}
+        for key, value in values.items():
+            if value is not None:
+                self.settings[key] = value
+        after = {key: value for key, value in self.settings.items() if key != "dpi"}
+        if after != before or not self._settings_seen:
+            log(f"settings: {json.dumps(after, sort_keys=True)}")
+        self._settings_seen = True
+        # A drag arrives as a burst of a hundred and sixty values. Throttle
+        # rather than debounce: a pending write keeps its deadline and takes the
+        # latest value, so the pointer changes while the slider is moving
+        # instead of only once it stops, and the device still sees a handful of
+        # writes rather than one per step.
+        self._pending_dpi = self.snap_dpi(self.settings.get("dpi"))
+        if self._pending_dpi_at is None:
+            self._pending_dpi_at = time.monotonic() + DPI_THROTTLE
+        self.check_battery_thresholds()
+        self.publish()
+
+    def flush_dpi(self):
+        wanted, self._pending_dpi = self._pending_dpi, None
+        self._pending_dpi_at = None
+        if wanted is None or not self.present or self.conflict:
+            return
+        if wanted == self.device_dpi:
+            return
+        with self.device_conversation():
+            self.write_dpi(wanted)
+        self.publish()
+
+    # ----------------------------------------------------------- the loop
+
+    def run(self):
+        self.reconcile()
+        self.publish()
+        if self.once:
+            return 0
+
+        stdin_fd = sys.stdin.fileno()
+        os.set_blocking(stdin_fd, False)
+        stdin_open = True
+
+        while self._running:
+            # Frames that arrived while a request was awaiting its reply are
+            # handled before we go back to waiting, or they would sit unseen
+            # until the device happened to speak again.
+            if self.link and self.link.pending:
+                queued, self.link.pending = self.link.pending, []
+                for frame in queued:
+                    self.handle_frame(frame)
+                self.publish()
+            fds = [stdin_fd] if stdin_open else []
+            if self.link:
+                fds.append(self.link.fd)
+            timeout = self.next_deadline()
+            ready, _, _ = select.select(fds, [], [], timeout) if fds else ((), (), ())
+            if stdin_open and stdin_fd in ready:
+                stdin_open = self.pump_stdin(stdin_fd)
+            if self.link and self.link.fd in ready:
+                try:
+                    for frame in self.link.drain():
+                        self.handle_frame(frame)
+                    self.publish()
+                except DeviceGone as exc:
+                    self.drop_link(str(exc))
+            now = time.monotonic()
+            if self._pending_dpi_at is not None and now >= self._pending_dpi_at:
+                self.flush_dpi()
+            if now >= self._next_verify:
+                self._next_verify = now + VERIFY_INTERVAL
+                self.reconcile()
+            if not stdin_open and not self.link:
+                break
+        return 0
+
+    def next_deadline(self):
+        now = time.monotonic()
+        deadlines = [self._next_verify]
+        if self._pending_dpi_at is not None:
+            deadlines.append(self._pending_dpi_at)
+        return max(0.01, min(deadlines) - now)
+
+    def pump_stdin(self, fd):
+        try:
+            chunk = os.read(fd, 65536)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        if not chunk:
+            self._running = False
+            return False
+        self._stdin += chunk
+        while b"\n" in self._stdin:
+            line, self._stdin = self._stdin.split(b"\n", 1)
+            text = line.decode("utf-8", "replace").strip()
+            if text:
+                self.handle_line(text)
+        return True
+
+
+# -------------------------------------------------------------- small tools
+
+
+def parse_dpi_list(raw):
+    """Decode a getSensorDpiList reply into every DPI the device accepts.
+
+    A value whose top three bits are set is a step: the next value is the end of
+    a range running from the previous entry in steps of that size.
+    """
+    values = []
+    i = 0
+    while i + 1 < len(raw):
+        value = (raw[i] << 8) | raw[i + 1]
+        if value == 0:
+            break
+        if value >> 13 == 0b111:
+            step = value & 0x1FFF
+            if not values or i + 3 >= len(raw):
+                break
+            last = (raw[i + 2] << 8) | raw[i + 3]
+            if last <= values[-1] or step <= 0:
+                break
+            values.extend(range(values[-1] + step, last + 1, step))
+            i += 4
+        else:
+            values.append(value)
+            i += 2
+    return values
+
+
+# wtype names the Windows key "logo"; everyone else calls it Super. A Binding
+# hand-written into shell.json with the name its owner knows would be refused
+# outright ("Invalid modifier name 'super'") and the Gesture would do nothing
+# with nothing to show for it.
+MODIFIER_ALIASES = {
+    "super": "logo",
+    "meta": "logo",
+    "cmd": "logo",
+    "mod4": "logo",
+    "control": "ctrl",
+    "option": "alt",
+}
+
+
+def keystroke_argv(keys):
+    """Deliver a keystroke through the Wayland virtual-keyboard path.
+
+    Not by synthesising kernel-level key events: those are interpreted through
+    whichever keyboard layout is active, so a Binding stored as a keysym would
+    deliver a different keysym the moment a Cyrillic layout was in front. wtype
+    supplies its own keymap and is layout-independent.
+
+    Measured rather than assumed: with the Russian layout active, `wtype -k w`
+    delivers 0x77 — an ASCII "w" — where the physical W key on that layout
+    produces U+0446 "ц" (d1 86). Anything that replaces this with a kernel-level
+    injector has to clear that same bar.
+    """
+    modifiers, key = keys[:-1], keys[-1]
+    argv = ["wtype"]
+    for modifier in modifiers:
+        argv += ["-M", MODIFIER_ALIASES.get(modifier.lower(), modifier.lower())]
+    argv += ["-k", key]
+    for modifier in reversed(modifiers):
+        argv += ["-m", MODIFIER_ALIASES.get(modifier.lower(), modifier.lower())]
+    return argv
+
+
+def run_tool(argv):
+    """Run an external tool, quietly. Returns its exit status, or None."""
+    if shutil.which(argv[0]) is None:
+        log(f"{argv[0]} is not installed")
+        return None
+    try:
+        return subprocess.run(
+            argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+        ).returncode
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"{argv[0]} failed: {exc}")
+        return None
+
+
+def disable_autostart(path):
+    """Turn off an XDG autostart entry without rewriting anything else in it."""
+    if not path or not os.path.exists(path):
+        log(f"no autostart entry at {path}")
+        return False
+    try:
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+    except OSError as exc:
+        log(f"cannot read {path}: {exc}")
+        return False
+    wanted = {"Hidden": "true", "X-GNOME-Autostart-enabled": "false"}
+    seen = set()
+    out = []
+    for line in lines:
+        key = line.split("=", 1)[0].strip()
+        if key in wanted:
+            out.append(f"{key}={wanted[key]}")
+            seen.add(key)
+        else:
+            out.append(line)
+    for key, value in wanted.items():
+        if key not in seen:
+            out.append(f"{key}={value}")
+    try:
+        with open(path, "w") as fh:
+            fh.write("\n".join(out) + "\n")
+    except OSError as exc:
+        log(f"cannot write {path}: {exc}")
+        return False
+    return True
+
+
+def acquire_lock(path, timeout=15.0):
+    """Hold the device alone.
+
+    The shell hot-reloads plugin code whenever any file under the plugins
+    directory is saved, so a new Helper routinely starts before the old one has
+    let go. Two Helpers reading the same Control means every Gesture fires
+    twice, so a new instance waits for its predecessor rather than racing it.
+    """
+    directory = os.path.dirname(path)
+    if directory:
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except OSError:
+            pass
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    end = time.monotonic() + timeout
+    waited = False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if waited:
+                log("the previous Helper let go of the mouse")
+            return fd
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            if time.monotonic() >= end:
+                os.close(fd)
+                return None
+            if not waited:
+                log("another Helper still holds the mouse; waiting for it")
+                waited = True
+            time.sleep(0.05)
+
+
+def runtime_dir():
+    return os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+
+
+def default_lock_path():
+    return os.path.join(runtime_dir(), f"{PLUGIN_ID}.lock")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--once", action="store_true",
+        help="print one state line and exit, without configuring the mouse",
+    )
+    args = parser.parse_args(argv)
+
+    path = os.environ.get("MX_MASTER_DEVICE") or None
+    autostart = os.environ.get("MX_MASTER_AUTOSTART") or os.path.expanduser(
+        "~/.config/autostart/solaar.desktop"
+    )
+    state_path = os.environ.get("MX_MASTER_STATE") or os.path.join(
+        runtime_dir(), f"{PLUGIN_ID}.state"
+    )
+
+    lock_fd = None
+    if not args.once:
+        # A one-shot read never writes to the mouse, so it does not need to be
+        # the only one holding it.
+        lock_fd = acquire_lock(os.environ.get("MX_MASTER_LOCK") or default_lock_path())
+        if lock_fd is None:
+            log("gave up waiting for the Helper that already holds the mouse")
+            return 1
+
+    helper = Helper(path, autostart, state_path, once=args.once)
+    try:
+        return helper.run()
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        if helper.link:
+            helper.link.close()
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

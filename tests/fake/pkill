@@ -1,0 +1,9 @@
+#!/bin/bash
+# Recording fake for stopping the conflicting program. Removing the marker file
+# is what makes the next probe agree that the conflict is over — the point of
+# the resolve action is that gestures arm by themselves afterwards.
+printf 'pkill' >> "${FAKE_LOG:?FAKE_LOG not set}"
+printf '\t%s' "$@" >> "$FAKE_LOG"
+printf '\n' >> "$FAKE_LOG"
+[[ -n ${FAKE_CONFLICT:-} ]] && rm -f "$FAKE_CONFLICT"
+exit 0

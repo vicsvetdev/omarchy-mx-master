@@ -1,0 +1,13 @@
+#!/bin/bash
+# Recording fake for the conflicting-program probe. FAKE_CONFLICT names a file
+# whose existence means another device manager is running; a suite creates or
+# removes it to model the conflict arriving and going away. Exit 0 with a pid
+# when it is running and exit 1 when it is not, which is what real pgrep does.
+printf 'pgrep' >> "${FAKE_LOG:?FAKE_LOG not set}"
+printf '\t%s' "$@" >> "$FAKE_LOG"
+printf '\n' >> "$FAKE_LOG"
+if [[ -n ${FAKE_CONFLICT:-} && -e ${FAKE_CONFLICT} ]]; then
+  echo 4242
+  exit 0
+fi
+exit 1

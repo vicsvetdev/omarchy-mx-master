@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# The spec and the tickets this plugin was built from. Development notes rather
+# than part of the plugin: delete this line to publish them alongside it.
+.scratch/

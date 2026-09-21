@@ -1,0 +1,8 @@
+#!/bin/bash
+# Recording fake for the keystroke tool. The Helper must reach the Wayland
+# virtual-keyboard path through this name and no other, so a suite can assert
+# on exactly which keys a Gesture delivered.
+printf 'wtype' >> "${FAKE_LOG:?FAKE_LOG not set}"
+printf '\t%s' "$@" >> "$FAKE_LOG"
+printf '\n' >> "$FAKE_LOG"
+exit 0

@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "id": "vicsvetdev.mx-master",
+  "name": "MX Master",
+  "version": "1.0.0",
+  "author": "vicsvet",
+  "license": "MIT",
+  "description": "Battery, DPI and thumb gestures for a Logitech MX Master 3S, spoken to the mouse directly over HID++.",
+  "homepage": "https://github.com/vicsvetdev/omarchy-mx-master",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "MX Master",
+    "description": "The mouse's battery on the bar. Left click opens a panel with a DPI slider, the gesture bindings, and whether gestures are armed; right click hides or shows the percentage.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showPercent": true,
+      "dpi": 1000,
+      "lowBattery": 20,
+      "criticalBattery": 10
+    },
+    "schema": [
+      {
+        "key": "showPercent",
+        "type": "boolean",
+        "label": "Show the percentage",
+        "defaultValue": true,
+        "description": "Off leaves the mouse icon alone on the bar, which is as quiet as the rest of it. Right-clicking the widget toggles this too."
+      },
+      {
+        "key": "dpi",
+        "type": "integer",
+        "label": "DPI",
+        "min": 200,
+        "max": 8000,
+        "step": 50,
+        "defaultValue": 1000,
+        "description": "The mouse's own hardware pointer resolution, not the compositor's pointer acceleration. The mouse forgets this whenever it loses power, so this value is what gets put back."
+      },
+      {
+        "key": "lowBattery",
+        "type": "integer",
+        "label": "Warn at",
+        "min": 5,
+        "max": 50,
+        "step": 5,
+        "defaultValue": 20,
+        "description": "Percent. One notification when the battery first falls past this, and none again until it has charged back above it."
+      },
+      {
+        "key": "criticalBattery",
+        "type": "integer",
+        "label": "Warn urgently at",
+        "min": 1,
+        "max": 30,
+        "step": 1,
+        "defaultValue": 10,
+        "description": "Percent. A second, louder notification, so a warning dismissed while busy gets another chance."
+      }
+    ]
+  }
+}
