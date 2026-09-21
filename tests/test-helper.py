@@ -289,6 +289,18 @@ suite.expect("conflict: the other program's own configuration is left untouched"
 h.stop()
 
 # The conflict ending on its own must arm on the next tick, with no restart.
+# Diverting the Gesture Button removes its ordinary function. Taking it when no
+# Action could be delivered is strictly worse than leaving it alone, and a panel
+# saying "armed" while every Tap does nothing is the silent failure the status
+# line exists to prevent.
+h = Helper(missing_tools=("wtype",))
+state = h.wait(lambda s: s.get("present") is True and s.get("armed") is False)
+suite.expect("arming: the Gesture Button is not taken when keystrokes cannot be delivered",
+             state is not None and "wtype" in (state["reason"] or ""))
+suite.expect("arming: and the mouse's configuration is left alone while that is true",
+             h.device.arming_writes() == [])
+h.stop()
+
 h = Helper(conflict=True)
 h.wait_for(status="conflict")
 h.end_conflict()

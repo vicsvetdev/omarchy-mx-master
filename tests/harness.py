@@ -34,7 +34,8 @@ from device import FakeDevice  # noqa: E402
 class Helper:
     """One Helper process, its device, and the fakes it called."""
 
-    def __init__(self, settings=None, conflict=False, extra_env=None, args=()):
+    def __init__(self, settings=None, conflict=False, extra_env=None, args=(),
+                 missing_tools=()):
         self.dir = tempfile.mkdtemp(prefix="mx-master-test.")
         self.device = FakeDevice(os.path.join(self.dir, "hidpp.sock"))
         self.log = os.path.join(self.dir, "fakes.log")
@@ -45,7 +46,18 @@ class Helper:
         open(self.log, "w").close()
 
         env = dict(os.environ)
-        env["PATH"] = os.path.join(HERE, "fake") + os.pathsep + env["PATH"]
+        fakes = os.path.join(HERE, "fake")
+        if missing_tools:
+            # A PATH holding only the fakes we chose to provide, so a suite can
+            # model a machine where one of the tools simply is not installed.
+            only = os.path.join(self.dir, "bin")
+            os.makedirs(only)
+            for name in os.listdir(fakes):
+                if name not in missing_tools:
+                    shutil.copy2(os.path.join(fakes, name), os.path.join(only, name))
+            env["PATH"] = only
+        else:
+            env["PATH"] = fakes + os.pathsep + env["PATH"]
         env["FAKE_LOG"] = self.log
         self.conflict_marker = os.path.join(self.dir, "conflict")
         env["FAKE_CONFLICT"] = self.conflict_marker

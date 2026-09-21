@@ -181,7 +181,9 @@ expect "the Helper translates the modifier names people actually write" \
 # kernel-level key events would deliver a different keysym the moment the
 # Cyrillic layout was in front.
 expect "keystrokes go through the virtual-keyboard tool and nothing else" \
-  'grep -q "argv = \[\"wtype\"\]" "$helper" && ! grep -q "ydotool\|uinput" "$helper"'
+  'grep -q "KEYSTROKE_TOOL = \"wtype\"" "$helper" \
+   && grep -q "argv = \[KEYSTROKE_TOOL\]" "$helper" \
+   && ! grep -q "ydotool\|uinput" "$helper"'
 
 # The plugin installs as a folder with no build step and needs no root.
 expect "the plugin needs no build step" \

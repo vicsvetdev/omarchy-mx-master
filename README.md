@@ -42,8 +42,16 @@ omarchy plugin remove vicsvetdev.mx-master   # and it is gone
   Bluetooth is a different endpoint and is not this plugin's device, and no
   other Logitech device is either.
 - **`wtype`**, for delivering keystrokes through the Wayland virtual-keyboard
-  protocol. `pacman -S wtype`.
-- **`omarchy-notification-send`**, which ships with Omarchy.
+  protocol.
+- **`omarchy-notification-send`**, for the low-battery notices.
+
+Both ship with Omarchy — `wtype` is in its base packages and
+`omarchy-notification-send` is part of Omarchy itself — so on a stock system
+there is nothing to install. `omarchy plugin add` only clones and validates;
+it installs no packages and runs no hooks, so if `wtype` has been removed,
+`sudo pacman -S wtype` puts it back. Until it is there the plugin will not take
+the Gesture Button at all, and the panel says why rather than pretending
+gestures work.
 
 There is no build step, nothing to compile, and nothing that needs root: the
 Helper is Python using only the standard library, and access to the receiver

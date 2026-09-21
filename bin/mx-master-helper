@@ -66,6 +66,10 @@ ARMED_FLAGS = MAP_DIVERTED | MAP_RAW_XY
 # QML contract suite pins that agreement.
 PLUGIN_ID = "vicsvetdev.mx-master"
 
+# The tool that delivers a keystroke. Omarchy ships it in its base packages, but
+# a plugin install does not install anything, so it can be absent.
+KEYSTROKE_TOOL = "wtype"
+
 VENDOR_LOGITECH = 0x046D
 BOLT_RECEIVERS = {0xC548}  # Logi Bolt. USB-C and Bluetooth are not this plugin's device.
 DEVICE_NAME_MATCH = "mx master 3s"
@@ -717,6 +721,14 @@ class Helper:
             self.armed = False
             self.reason = "Solaar is running and manages this mouse."
             return
+        if shutil.which(KEYSTROKE_TOOL) is None:
+            # Diverting the Gesture Button takes away its ordinary function and
+            # gives nothing back if no Action can be delivered. Stand down and
+            # say so, rather than leave a panel claiming gestures are armed
+            # while every Tap quietly does nothing.
+            self.armed = False
+            self.reason = f"{KEYSTROKE_TOOL} is not installed, so a Gesture cannot deliver anything."
+            return
         index = self.feature(F_REPROG_CONTROLS_V4)
         if not index:
             self.armed = False
@@ -1073,7 +1085,7 @@ def keystroke_argv(keys):
     injector has to clear that same bar.
     """
     modifiers, key = keys[:-1], keys[-1]
-    argv = ["wtype"]
+    argv = [KEYSTROKE_TOOL]
     for modifier in modifiers:
         argv += ["-M", MODIFIER_ALIASES.get(modifier.lower(), modifier.lower())]
     argv += ["-k", key]
