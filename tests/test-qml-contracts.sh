@@ -186,6 +186,15 @@ expect "keystrokes go through the virtual-keyboard tool and nothing else" \
    && ! grep -q "ydotool\|uinput" "$helper"'
 
 # The plugin installs as a folder with no build step and needs no root.
+# The plugin ships the udev rule it needs, because `omarchy plugin add` cannot
+# install one — it clones files and nothing else.
+expect "the udev rule the plugin needs is shipped with it" \
+  '[ -f "$root/udev/99-mx-master.rules" ] \
+   && grep -q "c548" "$root/udev/99-mx-master.rules" \
+   && grep -q "uaccess" "$root/udev/99-mx-master.rules" \
+   && grep -q "99-mx-master.rules" "$root/README.md" \
+   && grep -q "99-mx-master.rules" "$helper"'
+
 expect "the plugin needs no build step" \
   '[ ! -f "$root/Makefile" ] && [ ! -f "$root/package.json" ] && [ ! -f "$root/meson.build" ]'
 expect "nothing asks for root" \

@@ -1,0 +1,24 @@
+# Let the seated user talk HID++ to a Logi Bolt receiver.
+#
+# /dev/hidraw* defaults to root-only, so without a rule like this the plugin
+# cannot open the receiver at all and the panel reports that it has no
+# permission. Solaar ships an equivalent rule, which is why a machine with
+# Solaar installed appears to work without this one — but this plugin exists
+# so that Solaar does not have to be installed.
+#
+# Narrower than Solaar's on purpose: that one grants access to every Logitech
+# device on the system, this one only to the Bolt receiver (046d:c548) this
+# plugin speaks to. Raw access to a Logitech receiver allows firmware updates,
+# so it is worth handing out no more of it than is needed.
+#
+# Install:
+#   sudo cp udev/99-mx-master.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# then unplug the receiver and plug it back in.
+
+ACTION=="remove", GOTO="mx_master_end"
+SUBSYSTEM!="hidraw", GOTO="mx_master_end"
+
+ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c548", TAG+="uaccess"
+
+LABEL="mx_master_end"

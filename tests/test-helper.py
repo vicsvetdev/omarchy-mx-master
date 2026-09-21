@@ -91,6 +91,21 @@ suite.expect("battery: a mouse that was already asleep is never shown as present
 h.stop()
 
 
+# A receiver the user cannot open is the default state of a machine without a
+# udev rule. "Permission denied" leaves nowhere to go; the reason has to name
+# the fix.
+denied_dir = tempfile.mkdtemp(prefix="mx-master-denied.")
+denied = os.path.join(denied_dir, "hidraw-denied")
+open(denied, "w").close()
+os.chmod(denied, 0o000)
+h = Helper(extra_env={"MX_MASTER_DEVICE": denied})
+state = h.wait(lambda s: s.get("present") is False and "udev" in (s.get("reason") or "").lower())
+suite.expect("permission: no access to the receiver says which rule to install",
+             state is not None)
+h.stop()
+shutil.rmtree(denied_dir, ignore_errors=True)
+
+
 # ----------------------------------------- 03 — disconnect, sleep, reload
 
 h = Helper(settings={"dpi": 1000})

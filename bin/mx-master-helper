@@ -526,7 +526,15 @@ class Helper:
         try:
             self.link = Link(path, swid=ONCE_SWID if self.once else SWID)
         except (DeviceGone, OSError) as exc:
-            self.go_offline(f"Cannot open the receiver: {exc}")
+            # /dev/hidraw* is root-only until a udev rule says otherwise, and a
+            # bare "Permission denied" leaves nowhere to go. Name the fix.
+            if isinstance(exc, OSError) and exc.errno == errno.EACCES or "denied" in str(exc).lower():
+                self.go_offline(
+                    "No permission to open the receiver. Install the plugin's "
+                    "udev rule (udev/99-mx-master.rules) and replug it."
+                )
+            else:
+                self.go_offline(f"Cannot open the receiver: {exc}")
             return False
         log(f"opened {path}")
         try:

@@ -53,10 +53,29 @@ it installs no packages and runs no hooks, so if `wtype` has been removed,
 the Gesture Button at all, and the panel says why rather than pretending
 gestures work.
 
-There is no build step, nothing to compile, and nothing that needs root: the
-Helper is Python using only the standard library, and access to the receiver
-and to the virtual-keyboard path is already granted to the seated user by
-existing udev rules.
+### One thing needs root, once
+
+`/dev/hidraw*` is root-only by default, so the plugin cannot open the receiver
+until a udev rule says the seated user may. The rule ships with the plugin;
+`omarchy plugin add` clones files and nothing else, so install it by hand:
+
+```bash
+sudo cp udev/99-mx-master.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Then unplug the receiver and plug it back in. Until that is done the widget
+stays hidden and the panel says it has no permission, naming this rule.
+
+If you already run Solaar, its own rule covers this — which is worth knowing,
+because it means a machine with Solaar installed appears to work without the
+step above and a machine without it does not. Solaar's rule grants raw access
+to *every* Logitech device; the one here is scoped to the Bolt receiver
+(`046d:c548`) alone, since raw access to a receiver permits firmware updates.
+
+Nothing else needs root, there is no build step and nothing to compile: the
+Helper is Python using only the standard library, and the virtual-keyboard
+path needs no special permission.
 
 > **If the widget does not appear, restart the shell once** with
 > `omarchy-restart-shell`. Qt's QML engine caches what it found in a directory,
